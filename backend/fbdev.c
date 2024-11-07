@@ -99,7 +99,6 @@ static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
     /* Set the virtual screen size to be the same as the physical screen */
     tx->fb_var.xres_virtual = tx->fb_var.xres;
     tx->fb_var.yres_virtual = tx->fb_var.yres;
-    tx->fb_var.bits_per_pixel = 32;
     if (ioctl(tx->fb_fd, FBIOPUT_VSCREENINFO, &tx->fb_var) < 0) {
         log_error("Failed to set framebuffer mode");
         return false;
@@ -108,12 +107,6 @@ static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
     /* Read changable information of the framebuffer again */
     if (ioctl(tx->fb_fd, FBIOGET_VSCREENINFO, &tx->fb_var) < 0) {
         log_error("Failed to get framebuffer information");
-        return false;
-    }
-
-    /* Check bits per pixel */
-    if (tx->fb_var.bits_per_pixel != 32) {
-        log_error("Failed to set framebuffer bpp to 32");
         return false;
     }
 
