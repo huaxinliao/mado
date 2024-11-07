@@ -22,7 +22,9 @@
 #define FBDEV_DEFAULT "/dev/fb0"
 #define SCREEN(x) ((twin_context_t *) x)->screen
 #define PRIV(x) ((twin_fbdev_t *) ((twin_context_t *) x)->priv)
-
+#define RGB32_TO_ARGB8565(pixel)(((pixel & 0x00f80000) >> 8) | \
+                                 ((pixel & 0x0000fc00) >> 5) | \
+                                 ((pixel & 0x000000f8) >> 3) )
 typedef struct {
     twin_screen_t *screen;
 
@@ -59,7 +61,23 @@ static void _twin_fbdev_put_span(twin_coord_t left,
     off_t off = top * screen->width + left;
     uint32_t *dest =
         (uint32_t *) ((uintptr_t) tx->fb_base + (off * sizeof(*dest)));
-    memcpy(dest, pixels, width * sizeof(*dest));
+
+    /* If the framebuffer is in 16 bpp mode, convert each pixel from 32 bpp (ARGB) to 16 bpp (RGB565).
+    * - Extracts the red, green, and blue channels from the 32-bit color value.
+    * - Shifts and masks each channel to fit into the 16-bit RGB565 format:
+    *      - 5 bits for red
+    *      - 6 bits for green
+    *      - 5 bits for blue
+    * - Combines the shifted color values into a single 16-bit pixel.
+    * If the framebuffer is in 32 bpp mode, directly copy the pixels to the framebuffer.
+    */
+    if(tx->fb_var.bits_per_pixel == 16){
+        for (int i = 0; i < width; i++) {
+            dest[i] = RGB32_TO_ARGB8565(pixels[i]);
+        }
+    }else{
+        memcpy(dest, pixels, width * sizeof(*dest));
+    }
 }
 
 static void twin_fbdev_get_screen_size(twin_fbdev_t *tx,
@@ -88,6 +106,18 @@ static bool twin_fbdev_work(void *closure)
     return true;
 }
 
+static bool fb_is_rgb565(twin_fbdev_t* tx) {
+    return tx->fb_var.red.offset == 11 && tx->fb_var.red.length == 5 &&
+         tx->fb_var.green.offset == 5 && tx->fb_var.green.length == 6 &&
+         tx->fb_var.blue.offset == 0 && tx->fb_var.blue.length == 5;
+}
+
+static bool fb_is_argb32(twin_fbdev_t* tx) {
+    return tx->fb_var.red.offset == 16 && tx->fb_var.red.length == 8 &&
+         tx->fb_var.green.offset == 8 && tx->fb_var.green.length == 8 &&
+         tx->fb_var.blue.offset == 0 && tx->fb_var.blue.length == 8;
+}
+
 static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
 {
     /* Read changable information of the framebuffer */
@@ -99,7 +129,6 @@ static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
     /* Set the virtual screen size to be the same as the physical screen */
     tx->fb_var.xres_virtual = tx->fb_var.xres;
     tx->fb_var.yres_virtual = tx->fb_var.yres;
-    tx->fb_var.bits_per_pixel = 32;
     if (ioctl(tx->fb_fd, FBIOPUT_VSCREENINFO, &tx->fb_var) < 0) {
         log_error("Failed to set framebuffer mode");
         return false;
@@ -111,10 +140,17 @@ static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
         return false;
     }
 
-    /* Check bits per pixel */
-    if (tx->fb_var.bits_per_pixel != 32) {
-        log_error("Failed to set framebuffer bpp to 32");
-        return false;
+    /* Examine the framebuffer format */
+    if (tx->fb_var.bits_per_pixel == 16) {
+        if(!fb_is_rgb565(tx)){
+            log_error("Invalid framebuffer format for 16 bpp");
+            return false;
+        }
+    }else{
+        if(!fb_is_argb32(tx)){
+            log_error("Invalid framebuffer format for 32 bpp");
+            return false;
+        }
     }
 
     /* Read unchangable information of the framebuffer */
