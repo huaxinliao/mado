@@ -6,9 +6,11 @@
 
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <termios.h>
 #include <twin.h>
 #include <unistd.h>
 
@@ -30,6 +32,11 @@ typedef struct {
 
     /* Linux virtual terminal (VT) */
     int vt_fd;
+    int vx_fd;
+    int vt_swsig;
+    int old_kbmode;
+    struct termios old_tio;
+    bool vt_active;
 
     /* Linux framebuffer */
     int fb_fd;
@@ -93,13 +100,14 @@ static void twin_fbdev_damage(twin_screen_t *screen, twin_fbdev_t *tx)
     twin_screen_damage(tx->screen, 0, 0, width, height);
 }
 
-static bool twin_fbdev_work(void *closure)
+static void twin_fbdev_damaged(void *closure)
 {
     twin_screen_t *screen = SCREEN(closure);
+    twin_fbdev_t *tx = PRIV(closure);
 
-    if (twin_screen_damaged(screen))
+    /* VT switch is ready */
+    if (tx->vt_active && screen && twin_screen_damaged(screen))
         twin_screen_update(screen);
-    return true;
 }
 
 static inline bool twin_fbdev_is_rgb565(twin_fbdev_t *tx)
@@ -192,6 +200,109 @@ static bool twin_fbdev_apply_config(twin_fbdev_t *tx)
     return true;
 }
 
+static void twin_fbdev_switch(twin_fbdev_t *tx, int activate)
+{
+    tx->vt_active = activate;
+
+    /* Upon activation */
+    if (activate) {
+        /* Switch complete */
+        ioctl(tx->vt_fd, VT_RELDISP, VT_ACKACQ);
+
+        /* Restore fbdev settings */
+        if (twin_fbdev_apply_config(tx)) {
+            tx->vt_active = true;
+
+            /* Mark entire screen for refresh */
+            if (tx->screen)
+                twin_screen_damage(tx->screen, 0, 0, tx->screen->width,
+                                   tx->screen->height);
+        }
+    } else {
+        /* FIXME: should expose some option to disallow them */
+        ioctl(tx->vt_fd, VT_RELDISP, 1);
+
+        tx->vt_active = false;
+
+        if (tx->fb_base != MAP_FAILED) {
+            munmap(tx->fb_base, tx->fb_len);
+            tx->fb_base = MAP_FAILED;
+        }
+    }
+}
+
+static bool vt_switch_pending;
+
+static bool twin_fbdev_work(void *closure)
+{
+    twin_screen_t *screen = SCREEN(closure);
+    twin_fbdev_t *tx = PRIV(closure);
+
+    if (twin_screen_damaged(screen))
+        twin_screen_update(screen);
+
+    if (vt_switch_pending) {
+        twin_fbdev_switch(tx, !tx->vt_active);
+        vt_switch_pending = false;
+    }
+
+    return true;
+}
+
+static void twin_fbdev_vtswitch(int sig)
+{
+    signal(sig, twin_fbdev_vtswitch);
+    vt_switch_pending = true;
+}
+
+static bool twin_fbdev_setup_vt(twin_fbdev_t *tx, int switch_sig)
+{
+    struct vt_mode vtm;
+    struct termios tio;
+
+    /* Retrieve current VT mode */
+    if (ioctl(tx->vt_fd, VT_GETMODE, &vtm) < 0) {
+        log_info("can't get VT mode");
+        return 0;
+    }
+    /* Set VT mode to process mode, with specified signal for switching */
+    vtm.mode = VT_PROCESS;
+    vtm.relsig = switch_sig;
+    vtm.acqsig = switch_sig;
+
+    signal(switch_sig, twin_fbdev_vtswitch);
+    tx->vt_swsig = switch_sig;
+
+    /* Apply VT mode settings */
+    if (ioctl(tx->vt_fd, VT_SETMODE, &vtm) < 0) {
+        log_info("can't set VT mode");
+        signal(switch_sig, SIG_IGN);
+        return 0;
+    }
+
+    /* Save and configure terminal settings */
+    tcgetattr(tx->vt_fd, &tx->old_tio);
+
+    ioctl(tx->vt_fd, KDGKBMODE, &tx->old_kbmode);
+    ioctl(tx->vt_fd, KDSKBMODE, K_MEDIUMRAW);
+
+    tio = tx->old_tio;
+    tio.c_iflag = (IGNPAR | IGNBRK) & (~PARMRK) & (~ISTRIP);
+    tio.c_oflag = 0;
+    tio.c_cflag = CREAD | CS8;
+    tio.c_lflag = 0;
+    tio.c_cc[VTIME] = 0;
+    tio.c_cc[VMIN] = 1;
+    cfsetispeed(&tio, 9600);
+    cfsetospeed(&tio, 9600);
+    tcsetattr(tx->vt_fd, TCSANOW, &tio);
+
+    /* Set virtual console to graphics mode */
+    ioctl(tx->vx_fd, KDSETMODE, KD_GRAPHICS);
+
+    return true;
+}
+
 twin_context_t *twin_fbdev_init(int width, int height)
 {
     char *fbdev_path = getenv(FBDEV_NAME);
@@ -220,6 +331,10 @@ twin_context_t *twin_fbdev_init(int width, int height)
     /* Set up virtual terminal environment */
     if (!twin_vt_setup(&tx->vt_fd)) {
         goto bail_fb_fd;
+    }
+
+    if (!twin_fbdev_setup_vt(tx, SIGUSR1)) {
+        goto bail_vt_fd;
     }
 
     /* Apply configurations to the framebuffer device */
@@ -254,6 +369,8 @@ twin_context_t *twin_fbdev_init(int width, int height)
     /* Setup file handler and work functions */
     twin_set_work(twin_fbdev_work, TWIN_WORK_REDISPLAY, ctx);
 
+    /* Enable immediate refresh */
+    twin_screen_register_damaged(ctx->screen, twin_fbdev_damaged, ctx);
     return ctx;
 
 bail_screen:
